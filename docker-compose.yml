@@ -1,0 +1,270 @@
+# ================================================
+# op-stack Docker Compose
+# Full-stack deployment configuration
+# ================================================
+#
+# Architecture:
+#   web (3000) -> gateway (8080) -> service (8081)
+#                                -> executor (8082)
+#                                -> tools (8083)
+#                                -> auth (8084)
+#   service -> executor
+#
+# Usage:
+#   cd op-stack-deploy
+#   docker-compose build
+#   docker-compose up -d
+#
+# ================================================
+
+services:
+  # ============================================
+  # Infrastructure Services
+  # ============================================
+
+  mysql:
+    image: mysql:8.0
+    container_name: op-stack-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_CHARACTER_SET_SERVER: utf8mb4
+      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root123}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - op-stack-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: op-stack-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - op-stack-network
+
+  # ============================================
+  # Backend Services
+  # ============================================
+
+  auth:
+    build:
+      context: ../op-stack-auth
+      dockerfile: Dockerfile
+    container_name: op-stack-auth
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: op_stack_auth
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      JWT_SECRET: ${JWT_SECRET:-docker-secret-key-for-jwt-token-must-be-at-least-256-bits-long-for-hmac-sha256}
+      JWT_EXPIRATION: ${JWT_EXPIRATION:-3600}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8084/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - op-stack-network
+
+  service:
+    build:
+      context: ../op-stack-service
+      dockerfile: Dockerfile
+    container_name: op-stack-service
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: op_stack_service
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET:-docker-secret-key-for-jwt-token-must-be-at-least-256-bits-long-for-hmac-sha256}
+      EXECUTOR_BASE_URL: http://executor:8082
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dockerEncryptionKey1234567890ab}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - op-stack-network
+
+  executor:
+    build:
+      context: ../op-stack-executor
+      dockerfile: Dockerfile
+    container_name: op-stack-executor
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    environment:
+      DB_TYPE: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: op_stack_executor
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      REDIS_URL: redis://redis:6379/0
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      USE_IAM_ROLE: ${USE_IAM_ROLE:-false}
+      AWS_BEDROCK_MODEL_ID: ${AWS_BEDROCK_MODEL_ID:-us.anthropic.claude-sonnet-4-20250514-v1:0}
+      PORT: 8080
+      HOST: 0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - op-stack-network
+
+  tools:
+    build:
+      context: ../op-stack-tools
+      dockerfile: Dockerfile
+    container_name: op-stack-tools
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8083:6060"
+    environment:
+      APP_NAME: AIOps Tools
+      DEBUG: "false"
+      ENVIRONMENT: development
+      SECRET_KEY: ${TOOLS_SECRET_KEY:-change-me-in-production}
+      DATABASE_URL: mysql+aiomysql://root:${MYSQL_ROOT_PASSWORD:-root123}@mysql:3306/op_stack_tools
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      TOOL_EXECUTION_TIMEOUT: 300
+      MAX_CONCURRENT_EXECUTIONS: 10
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6060/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - op-stack-network
+
+  gateway:
+    build:
+      context: ../op-stack-gateway
+      dockerfile: Dockerfile
+    container_name: op-stack-gateway
+    restart: unless-stopped
+    depends_on:
+      auth:
+        condition: service_healthy
+      service:
+        condition: service_healthy
+      executor:
+        condition: service_healthy
+      tools:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SERVICE_URL: http://service:8081
+      EXECUTOR_URL: http://executor:8080
+      TOOLS_URL: http://tools:6060
+      AUTH_URL: http://auth:8084
+      GATEWAY_AUTH_ENABLED: ${GATEWAY_AUTH_ENABLED:-false}
+      JWT_SECRET: ${JWT_SECRET:-docker-secret-key-for-jwt-token-must-be-at-least-256-bits-long-for-hmac-sha256}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - op-stack-network
+
+  # ============================================
+  # Frontend
+  # ============================================
+
+  web:
+    build:
+      context: ../op-stack-web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    container_name: op-stack-web
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - op-stack-network
+
+networks:
+  op-stack-network:
+    driver: bridge
+
+volumes:
+  mysql-data:
+    driver: local
+  redis-data:
+    driver: local
